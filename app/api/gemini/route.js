@@ -9,7 +9,7 @@
 // Vercel Pro: allow up to 60 seconds per invocation.
 export const maxDuration = 60;
 
-const GEMINI_MODEL = "gemini-2.0-flash-exp";
+const GEMINI_MODEL = "gemini-3-pro-image-preview";
 const MAX_PROMPT_CHARS = 1000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

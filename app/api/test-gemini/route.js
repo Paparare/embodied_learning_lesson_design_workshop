@@ -4,9 +4,9 @@
 export const maxDuration = 60;
 
 const MODELS_TO_TRY = [
+  "gemini-3-pro-image-preview",
   "gemini-2.0-flash-exp",
   "gemini-2.0-flash",
-  "gemini-1.5-flash",
 ];
 
 async function testModel(modelName, key) {
@@ -56,7 +56,7 @@ export async function GET() {
   return Response.json({
     keyPresent: true,
     keyPrefix,
-    activeModel: "gemini-2.0-flash-exp",  // what /api/gemini currently uses
+    activeModel: "gemini-3-pro-image-preview",  // what /api/gemini currently uses
     workingModel: working,
     allResults: results,
     verdict: working
