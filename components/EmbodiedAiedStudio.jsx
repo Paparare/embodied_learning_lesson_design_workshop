@@ -459,8 +459,11 @@ export default function EmbodiedAiedStudio() {
   // Facilitator mode: click the studio title 3 times quickly to unlock.
   const [facilitatorMode, setFacilitatorMode] = useState(false);
   const titleClickRef = useRef({ count: 0, timer: null });
+  // Designer registers its resetAll here so the logo click can invoke it.
+  const designerResetRef = useRef(null);
 
   const onTitleClick = () => {
+    // Triple-click (within 800ms) toggles facilitator mode.
     const ref = titleClickRef.current;
     ref.count += 1;
     if (ref.timer) clearTimeout(ref.timer);
@@ -468,6 +471,11 @@ export default function EmbodiedAiedStudio() {
     if (ref.count >= 3) {
       ref.count = 0;
       setFacilitatorMode((m) => !m);
+      return;
+    }
+    // Single-click while in design view → back to beginning.
+    if (view === "design" && designerResetRef.current) {
+      designerResetRef.current();
     }
   };
 
@@ -553,6 +561,7 @@ export default function EmbodiedAiedStudio() {
             me={me} lessons={lessons} setLessons={setLessons}
             lessonsRef={lessonsRef} indexMapRef={indexMapRef}
             setView={setView}
+            onRegisterReset={(fn) => { designerResetRef.current = fn; }}
           />
         )}
         {view === "gallery" && (
@@ -671,7 +680,7 @@ function Header({ view, setView, me, count, facilitatorMode, onTitleClick }) {
 // ============================================================
 // Designer
 // ============================================================
-function Designer({ me, lessons, setLessons, setView }) {
+function Designer({ me, lessons, setLessons, setView, onRegisterReset }) {
   const [stage, setStage] = useState("setup"); // setup | assemble | review | published
   const [subject, setSubject] = useState("");
   const [grade, setGrade] = useState("");
@@ -1064,7 +1073,14 @@ function Designer({ me, lessons, setLessons, setView }) {
     if (d) setDebrief(d);
   };
 
-  const resetAll = () => {
+  const resetAll = (skipConfirm = false) => {
+    // Warn before discarding work unless called from a context that already confirmed.
+    if (!skipConfirm && stage !== "setup") {
+      const ok = window.confirm(
+        "This will clear your current lesson and take you back to the beginning. Any unsaved content will be lost. Continue?"
+      );
+      if (!ok) return;
+    }
     setStage("setup"); setSubject(""); setGrade(""); setGoal("");
     setPieces([]); setTimeline({ open: [], core: [], close: [] });
     setOriginalPieces([]);
@@ -1072,6 +1088,12 @@ function Designer({ me, lessons, setLessons, setView }) {
     setGeneratedContent({}); setGeneratingAll(false); setRegenerating({}); setRegeneratingViz({});
     setGeneratedViz({});
   };
+
+  // Register resetAll with the parent so the logo click can invoke it.
+  useEffect(() => {
+    onRegisterReset?.(() => resetAll());
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   if (stage === "setup") {
     return <SetupStage
@@ -1102,7 +1124,13 @@ function Designer({ me, lessons, setLessons, setView }) {
         onRegenerate={regenerateOne}
         onRegenerateViz={regenerateVizOne}
         onUpdate={updateContent}
-        onBack={() => setStage("assemble")}
+        onBack={() => {
+          setGeneratedContent({});
+          setGeneratedViz({});
+          setRegenerating({});
+          setRegeneratingViz({});
+          setStage("assemble");
+        }}
         onPublish={publish}
         published={stage === "published"}
         debrief={debrief}
@@ -1269,26 +1297,52 @@ function ReviewStage({
       </div>
 
       {/* Action bar */}
-      <div style={{ marginTop: 32, textAlign: "center" }}>
+      {(() => {
+        const anyVizGenerating = Object.values(regeneratingViz || {}).some(Boolean);
+        const busy = generatingAll || anyVizGenerating;
+        const handleBack = () => {
+          if (busy) return;
+          const ok = window.confirm(
+            "Going back will take you to the assemble stage. All generated content and visuals will be removed. Continue?"
+          );
+          if (ok) onBack();
+        };
+        return (
+        <div style={{ marginTop: 32, textAlign: "center" }}>
         {!published ? (
-          <div style={{ display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap" }}>
-            <button onClick={onBack} disabled={generatingAll} style={{
-              background: "transparent", border: `1.5px solid ${C.ink}`, color: C.ink,
-              padding: "14px 28px", borderRadius: 50, fontFamily: FM, fontSize: 11,
-              letterSpacing: 1, cursor: generatingAll ? "not-allowed" : "pointer",
-              textTransform: "uppercase", opacity: generatingAll ? 0.5 : 1,
-            }}>
-              ← Back to assemble
-            </button>
-            <button onClick={onPublish} disabled={generatingAll} style={{
-              background: generatingAll ? C.muted : C.coral, color: "white",
-              border: "none", padding: "14px 36px", borderRadius: 50, fontFamily: FD,
-              fontSize: 18, fontWeight: 600, cursor: generatingAll ? "wait" : "pointer",
-              boxShadow: `0 8px 20px -8px ${C.coral}aa`,
-            }}>
-              {generatingAll ? "Generating…" : "Share to Gallery →"}
-            </button>
-          </div>
+          <>
+            {anyVizGenerating && (
+              <div style={{
+                marginBottom: 14, fontFamily: FM, fontSize: 10, color: C.coral,
+                letterSpacing: 0.8, textTransform: "uppercase",
+                display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+              }}>
+                <span>✦</span>
+                <span>Visual generation in progress — please wait before sharing</span>
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap" }}>
+              <button onClick={handleBack} disabled={busy} style={{
+                background: "transparent", border: `1.5px solid ${busy ? C.muted : C.ink}`,
+                color: busy ? C.muted : C.ink,
+                padding: "14px 28px", borderRadius: 50, fontFamily: FM, fontSize: 11,
+                letterSpacing: 1, cursor: busy ? "not-allowed" : "pointer",
+                textTransform: "uppercase", opacity: busy ? 0.5 : 1,
+                transition: "all 0.15s",
+              }}>
+                ← Back to assemble
+              </button>
+              <button onClick={onPublish} disabled={busy} style={{
+                background: busy ? C.muted : C.coral, color: "white",
+                border: "none", padding: "14px 36px", borderRadius: 50, fontFamily: FD,
+                fontSize: 18, fontWeight: 600, cursor: busy ? "not-allowed" : "pointer",
+                boxShadow: busy ? "none" : `0 8px 20px -8px ${C.coral}aa`,
+                transition: "all 0.15s",
+              }}>
+                {generatingAll ? "Generating content…" : anyVizGenerating ? "Generating visual…" : "Share to Gallery →"}
+              </button>
+            </div>
+          </>
         ) : (
           <div style={{
             background: C.cream, border: `1.5px solid ${C.sage}`, borderRadius: 16,
@@ -1325,7 +1379,9 @@ function ReviewStage({
             </div>
           </div>
         )}
-      </div>
+        </div>
+        );
+      })()}
     </div>
   );
 }
