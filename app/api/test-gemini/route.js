@@ -1,33 +1,19 @@
-// Debug endpoint — visit /api/test-gemini in the browser to diagnose Gemini issues.
-// Returns a JSON report: key present, model reachable, image generated, raw error if any.
-// Safe to leave deployed — it generates only a tiny test image and exposes no secrets.
+// Debug endpoint — visit /api/test-gemini in browser to diagnose Gemini issues.
+// Tests the active model and reports the exact error from Google's API.
 
 export const maxDuration = 60;
 
-export async function GET() {
-  const report = {
-    keyPresent: !!process.env.GEMINI_API_KEY,
-    keyPrefix: process.env.GEMINI_API_KEY
-      ? process.env.GEMINI_API_KEY.slice(0, 8) + "…"
-      : null,
-    model: "gemini-2.0-flash-preview-image-generation",
-    imageGenerated: false,
-    httpStatus: null,
-    error: null,
-    rawResponseSnippet: null,
-  };
+const MODELS_TO_TRY = [
+  "gemini-2.0-flash-exp",
+  "gemini-2.0-flash",
+  "gemini-1.5-flash",
+];
 
-  if (!process.env.GEMINI_API_KEY) {
-    return Response.json({ ...report, error: "GEMINI_API_KEY env var is missing on this deployment." });
-  }
-
+async function testModel(modelName, key) {
   const endpoint =
     `https://generativelanguage.googleapis.com/v1beta/models/` +
-    `gemini-2.0-flash-preview-image-generation:generateContent` +
-    `?key=${process.env.GEMINI_API_KEY}`;
-
+    `${modelName}:generateContent?key=${key}`;
   try {
-    // Try with TEXT+IMAGE modalities (required for this model)
     const res = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -36,29 +22,45 @@ export async function GET() {
         generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
       }),
     });
-
-    report.httpStatus = res.status;
     const data = await res.json().catch(() => null);
-    report.rawResponseSnippet = JSON.stringify(data)?.slice(0, 400);
-
-    if (!res.ok) {
-      report.error = data?.error?.message || `HTTP ${res.status}`;
-      return Response.json(report);
-    }
-
     const parts = data?.candidates?.[0]?.content?.parts ?? [];
-    const imgPart = parts.find((p) => p.inlineData?.data);
-    if (imgPart) {
-      report.imageGenerated = true;
-      report.mimeType = imgPart.inlineData.mimeType;
-    } else {
-      report.error =
-        "API returned 200 but no image part found. finishReason: " +
-        (data?.candidates?.[0]?.finishReason ?? "unknown");
-    }
+    const hasImage = parts.some((p) => p.inlineData?.data);
+    return {
+      model: modelName,
+      httpStatus: res.status,
+      imageGenerated: hasImage,
+      finishReason: data?.candidates?.[0]?.finishReason ?? null,
+      error: res.ok ? null : (data?.error?.message || `HTTP ${res.status}`),
+    };
   } catch (err) {
-    report.error = err?.message || String(err);
+    return { model: modelName, httpStatus: null, imageGenerated: false, error: err?.message };
+  }
+}
+
+export async function GET() {
+  if (!process.env.GEMINI_API_KEY) {
+    return Response.json({ error: "GEMINI_API_KEY env var is missing on this deployment." });
   }
 
-  return Response.json(report);
+  const keyPrefix = process.env.GEMINI_API_KEY.slice(0, 8) + "…";
+
+  // Test each model in sequence — stop at the first one that works.
+  const results = [];
+  let working = null;
+  for (const model of MODELS_TO_TRY) {
+    const result = await testModel(model, process.env.GEMINI_API_KEY);
+    results.push(result);
+    if (result.imageGenerated) { working = model; break; }
+  }
+
+  return Response.json({
+    keyPresent: true,
+    keyPrefix,
+    activeModel: "gemini-2.0-flash-exp",  // what /api/gemini currently uses
+    workingModel: working,
+    allResults: results,
+    verdict: working
+      ? `✓ Images work with model: ${working}`
+      : "✗ No model produced an image — check allResults for per-model errors",
+  });
 }
