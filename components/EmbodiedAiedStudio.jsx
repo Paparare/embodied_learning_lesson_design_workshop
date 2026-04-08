@@ -685,6 +685,7 @@ function Designer({ me, lessons, setLessons, setView }) {
   const [generatedContent, setGeneratedContent] = useState({});
   const [generatingAll, setGeneratingAll] = useState(false);
   const [regenerating, setRegenerating] = useState({}); // uid -> bool
+  const [generatedViz, setGeneratedViz] = useState({}); // uid -> { format, slides?, card?, slideImages?, cardImage? }
   // Snapshot of the original AI-generated pieces (for facilitator walkthrough).
   // Captured once at generate time; never mutated, even as teacher edits.
   const [originalPieces, setOriginalPieces] = useState([]);
@@ -889,10 +890,11 @@ function Designer({ me, lessons, setLessons, setView }) {
     return null;
   };
 
-  // Move from assemble → review, generating content for pieces that don't yet have it.
-  // Preserves any content the teacher has already reviewed / edited.
-  // Throttled to 3 concurrent API calls so 20+ teachers don't all blow through the
-  // conversation rate limit at once.
+  // Move from assemble → review, generating content then visualizations.
+  // Two sequential phases keeps peak API concurrency manageable for 20-25 simultaneous
+  // teachers: content first (3 concurrent), viz second (2 concurrent).
+  // Doing them in parallel per-piece would double concurrent calls and reliably hit
+  // Claude/Gemini rate limits.
   const generateAllAndReview = async () => {
     const all = [...timeline.open, ...timeline.core, ...timeline.close];
     if (all.length < 3) {
@@ -901,33 +903,123 @@ function Designer({ me, lessons, setLessons, setView }) {
     }
     setGeneratingAll(true);
     setStage("review");
-    // Only generate for pieces that don't already have content, so edits survive a back-and-forth.
+
+    // ── Phase 1: learning content ──────────────────────────────────────────────
+    // Skip pieces that already have content so edits survive a back-and-forth.
     const toGenerate = all.filter(p => !generatedContent[p.uid]);
-    if (toGenerate.length === 0) {
-      setGeneratingAll(false);
-      return;
+    if (toGenerate.length > 0) {
+      await parallelMapLimit(toGenerate, 3, async (p) => {
+        const result = await generateContentForPiece(p);
+        if (result) {
+          setGeneratedContent(prev => ({ ...prev, [p.uid]: result }));
+        }
+      });
     }
-    // Stream results in as they finish so the UI fills progressively, instead of
-    // waiting for the whole batch.
-    const updates = {};
-    await parallelMapLimit(toGenerate, 3, async (p) => {
-      const result = await generateContentForPiece(p);
-      if (result) {
-        updates[p.uid] = result;
-        setGeneratedContent(prev => ({ ...prev, [p.uid]: result }));
-      }
-    });
+
+    // ── Phase 2: visualizations ────────────────────────────────────────────────
+    // Run AFTER content so Claude/Gemini aren't hit with doubled concurrent load.
+    // Also catches pieces that already had content but never got a viz (e.g. the
+    // teacher navigated away and came back — the early-exit above would have
+    // skipped them entirely in the old code).
+    const toVisualize = all.filter(p => !generatedViz[p.uid]);
+    if (toVisualize.length > 0) {
+      await parallelMapLimit(toVisualize, 2, async (p) => {
+        const viz = await generateVizForPiece(p);
+        if (viz) {
+          setGeneratedViz(prev => ({ ...prev, [p.uid]: viz }));
+        }
+      });
+    }
+
     setGeneratingAll(false);
   };
 
-  // Regenerate a single piece (from review screen)
+  // Regenerate a single piece (from review screen).
+  // Refreshes both learning content AND visualization so they stay in sync.
+  // Content and viz run sequentially (not parallel) to avoid doubling API load
+  // when multiple teachers regenerate at the same time.
   const regenerateOne = async (piece) => {
     setRegenerating(r => ({ ...r, [piece.uid]: true }));
     const result = await generateContentForPiece(piece);
     if (result) {
       setGeneratedContent(c => ({ ...c, [piece.uid]: result }));
     }
+    const viz = await generateVizForPiece(piece);
+    if (viz) {
+      setGeneratedViz(v => ({ ...v, [piece.uid]: viz }));
+    }
     setRegenerating(r => ({ ...r, [piece.uid]: false }));
+  };
+
+  // Generate a visualization (slide deck or scenario card) for a single piece.
+  // Uses recommendViz() to pick format, then calls Claude (Haiku) + Gemini.
+  // Returns { format, slides?, slideImages?, card?, cardImage? } or null on failure.
+  const generateVizForPiece = async (piece) => {
+    const rec = recommendViz(piece);
+    const isEmb = !!piece.transformedTo;
+    const origTitle = piece.title || "activity";
+    const embTitle = piece.transformedTo?.title || origTitle;
+    const why = piece.transformedTo?.why || piece.transformWhy || "";
+
+    const prompt = [
+      `Subject: ${subject}`,
+      `Grade: ${grade || "(any)"}`,
+      `Learning goal: ${goal || ""}`,
+      `Original non-embodied activity: "${origTitle}" (type: ${piece.type || "activity"})`,
+      isEmb
+        ? `Embodied transformation: "${embTitle}"${why ? `\nRationale: ${why}` : ""}`
+        : `Note: this activity has not been transformed yet — propose an embodied version.`,
+    ].join("\n");
+
+    const buildImgPrompt = (idx) => {
+      if (idx === 1 || idx === "card") {
+        return `Flat illustration, educational style, warm muted colors. A student performing: "${embTitle}" for ${subject || "school"}. Body posture clearly visible. No text. Clean lines. Academic presentation style.`;
+      }
+      if (idx === 2) {
+        return `Minimal flat illustration. Abstract: body movement connected to cognitive learning. Stylized brain and body. Warm muted palette. No text.`;
+      }
+      return `Flat illustration, educational style. A student doing a passive activity: "${origTitle}". Traditional classroom. Clean lines. No text.`;
+    };
+
+    // Retry helper: backs off 600ms, 1.2s, 2.4s on null/failure.
+    // callClaudeModel already swallows errors, so null = rate-limit or network issue.
+    const withRetry = async (fn, attempts = 3) => {
+      for (let i = 0; i < attempts; i++) {
+        const result = await fn();
+        if (result !== null) return result;
+        if (i < attempts - 1) await sleep(600 * Math.pow(2, i) + Math.random() * 300);
+      }
+      return null;
+    };
+
+    try {
+      if (rec.format === "card") {
+        const raw = await withRetry(() =>
+          callClaudeModel(vizCardSystem, prompt, 800, "claude-haiku-4-5-20251001")
+        );
+        const parsed = safeJSON(raw);
+        if (!parsed) return null;
+        // Single Gemini call for card — no burst issue.
+        const img = await callGemini(buildImgPrompt("card"));
+        return { format: "card", card: parsed, cardImage: img };
+      } else {
+        const raw = await withRetry(() =>
+          callClaudeModel(vizSlideSystem, prompt, 1200, "claude-haiku-4-5-20251001")
+        );
+        const parsed = safeJSON(raw);
+        if (!parsed?.slides) return null;
+        // SEQUENTIAL Gemini calls — NOT Promise.all — so we don't fire 3 concurrent
+        // Gemini requests per piece. With 25 users × 2 concurrent pieces × 3 parallel
+        // images = 150 simultaneous Gemini calls, which reliably 429s.
+        const slideImages = [];
+        for (let i = 0; i < parsed.slides.length; i++) {
+          slideImages.push(await callGemini(buildImgPrompt(i)));
+        }
+        return { format: "slides", slides: parsed.slides, slideImages };
+      }
+    } catch {
+      return null;
+    }
   };
 
   // Update one piece's generated content manually
@@ -991,6 +1083,7 @@ function Designer({ me, lessons, setLessons, setView }) {
     setOriginalPieces([]);
     setPublished(false); setDebrief("");
     setGeneratedContent({}); setGeneratingAll(false); setRegenerating({});
+    setGeneratedViz({});
   };
 
   if (stage === "setup") {
@@ -1015,6 +1108,7 @@ function Designer({ me, lessons, setLessons, setView }) {
         subject={subject} grade={grade} goal={goal}
         timeline={timeline}
         generatedContent={generatedContent}
+        generatedViz={generatedViz}
         generatingAll={generatingAll}
         regenerating={regenerating}
         onRegenerate={regenerateOne}
@@ -1103,7 +1197,7 @@ function Designer({ me, lessons, setLessons, setView }) {
 // ============================================================
 function ReviewStage({
   me, subject, grade, goal, timeline,
-  generatedContent, generatingAll, regenerating,
+  generatedContent, generatedViz, generatingAll, regenerating,
   onRegenerate, onUpdate, onBack, onPublish,
   published, debrief, onReset, onGoToGallery,
   embodiedCount, totalCount,
@@ -1172,11 +1266,13 @@ function ReviewStage({
             idx={i + 1}
             piece={p}
             content={generatedContent[p.uid]}
+            viz={generatedViz ? generatedViz[p.uid] : null}
             isRegenerating={!!regenerating[p.uid]}
             isLoadingAll={generatingAll && !generatedContent[p.uid]}
             onRegenerate={() => onRegenerate(p)}
             onUpdate={(data) => onUpdate(p.uid, data)}
             locked={published}
+            lessonContext={{ subject, grade, goal }}
           />
         ))}
       </div>
@@ -1246,9 +1342,10 @@ function ReviewStage({
 // ============================================================
 // Review Piece Card — shows generated content, allows edit/regen
 // ============================================================
-function ReviewPieceCard({ idx, piece, content, isRegenerating, isLoadingAll, onRegenerate, onUpdate, locked }) {
+function ReviewPieceCard({ idx, piece, content, viz, isRegenerating, isLoadingAll, onRegenerate, onUpdate, locked, lessonContext }) {
   const isEmbodied = !!piece.transformedTo;
   const borderColor = isEmbodied ? C.coral : C.ink;
+  const [slideIdx, setSlideIdx] = useState(0);
 
   return (
     <div style={{
@@ -1321,6 +1418,52 @@ function ReviewPieceCard({ idx, piece, content, isRegenerating, isLoadingAll, on
           No content yet. {!locked && "Tap ↻ Regenerate."}
         </div>
       )}
+
+      {/* ── Inline visualization (auto-generated alongside content) ── */}
+      {viz ? (
+        <div style={{
+          marginTop: 20,
+          borderTop: `1.5px dashed ${isEmbodied ? C.coral + "66" : C.muted + "55"}`,
+          paddingTop: 16,
+        }}>
+          <div style={{
+            fontFamily: FM, fontSize: 9, color: isEmbodied ? C.coral : C.muted,
+            letterSpacing: 1.2, textTransform: "uppercase", marginBottom: 12,
+            display: "flex", alignItems: "center", gap: 6,
+          }}>
+            {viz.format === "card" ? "🃏 Scenario Card" : "🖼️ Slide Deck"}
+            <span style={{ opacity: 0.6 }}>· AI-generated visualization</span>
+          </div>
+          {viz.format === "card" ? (
+            <ScenarioCardView
+              card={viz.card}
+              image={viz.cardImage}
+              generatingImage={false}
+              lesson={lessonContext}
+              piece={piece}
+            />
+          ) : viz.format === "slides" && viz.slides ? (
+            <VizSlideDeckView
+              slides={viz.slides}
+              images={viz.slideImages || []}
+              generatingImages={false}
+              currentSlide={slideIdx}
+              setCurrentSlide={setSlideIdx}
+              lesson={lessonContext}
+            />
+          ) : null}
+        </div>
+      ) : isLoadingAll ? (
+        <div style={{
+          marginTop: 16, padding: "10px 16px",
+          borderTop: `1.5px dashed ${C.muted + "44"}`,
+          fontFamily: FM, fontSize: 10, color: C.muted,
+          letterSpacing: 0.5, textTransform: "uppercase",
+          display: "flex", alignItems: "center", gap: 6,
+        }}>
+          <span style={{ opacity: 0.5 }}>🎨 Generating visualization…</span>
+        </div>
+      ) : null}
     </div>
   );
 }

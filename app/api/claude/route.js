@@ -21,6 +21,29 @@ const getClient = () => {
   return client;
 };
 
+// Exponential backoff retry for rate-limit (429) and transient (5xx) errors.
+// With 20-25 teachers hitting Generate at once, bursts will occasionally exceed
+// the API's per-minute token limit — retry transparently rather than failing.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const withRetry = async (fn, retries = 3, baseMs = 800) => {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isRetryable =
+        err?.status === 429 ||
+        err?.status === 529 || // Anthropic overload
+        (err?.status >= 500 && err?.status < 600);
+      if (!isRetryable || attempt === retries - 1) throw err;
+      // Jitter ± 20% so simultaneous requests don't all retry in sync.
+      const delay = baseMs * Math.pow(2, attempt) * (0.8 + Math.random() * 0.4);
+      console.warn(`/api/claude: attempt ${attempt + 1} failed (${err.status}), retrying in ${Math.round(delay)}ms`);
+      await sleep(delay);
+    }
+  }
+};
+
 export async function POST(req) {
   try {
     const body = await req.json().catch(() => null);
@@ -52,12 +75,14 @@ export async function POST(req) {
         ? model
         : "claude-sonnet-4-5-20250929";
 
-    const result = await getClient().messages.create({
-      model: resolvedModel,
-      max_tokens: cappedMaxTokens,
-      system,
-      messages: [{ role: "user", content: user }],
-    });
+    const result = await withRetry(() =>
+      getClient().messages.create({
+        model: resolvedModel,
+        max_tokens: cappedMaxTokens,
+        system,
+        messages: [{ role: "user", content: user }],
+      })
+    );
 
     // Flatten the content blocks into a single text string, matching the shape
     // the artifact's existing callClaude() helper expects.
@@ -69,8 +94,9 @@ export async function POST(req) {
     return Response.json({ text });
   } catch (err) {
     console.error("/api/claude error:", err);
+    const status = err?.status || 500;
     const message = err?.message || "Unknown error";
-    // Don't leak the API key or stack trace; return a clean error.
-    return Response.json({ error: message }, { status: 500 });
+    // Surface rate-limit status so the client can back off if needed.
+    return Response.json({ error: message }, { status: status === 429 ? 429 : 500 });
   }
 }
