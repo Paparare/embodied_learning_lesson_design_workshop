@@ -27,7 +27,7 @@ export async function POST(req) {
     if (!body || typeof body !== "object") {
       return Response.json({ error: "Invalid request body" }, { status: 400 });
     }
-    const { system, user, max_tokens } = body;
+    const { system, user, max_tokens, model } = body;
     if (typeof system !== "string" || typeof user !== "string") {
       return Response.json(
         { error: "Both 'system' and 'user' must be strings" },
@@ -41,8 +41,19 @@ export async function POST(req) {
       4096
     );
 
+    // Allow callers to specify a cheaper model (e.g. Haiku) for cost savings.
+    // Default to Sonnet. Only allow known Anthropic model strings.
+    const ALLOWED_MODELS = [
+      "claude-sonnet-4-5-20250929",
+      "claude-haiku-4-5-20251001",
+    ];
+    const resolvedModel =
+      typeof model === "string" && ALLOWED_MODELS.includes(model)
+        ? model
+        : "claude-sonnet-4-5-20250929";
+
     const result = await getClient().messages.create({
-      model: "claude-sonnet-4-5-20250929",
+      model: resolvedModel,
       max_tokens: cappedMaxTokens,
       system,
       messages: [{ role: "user", content: user }],

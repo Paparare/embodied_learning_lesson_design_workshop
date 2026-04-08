@@ -43,6 +43,39 @@ const callClaude = async (system, user, maxTokens = 1500) => {
   }
 };
 
+// Variant that accepts an optional model string (for cheaper Haiku calls in the visualizer).
+const callClaudeModel = async (system, user, maxTokens = 1500, model = null) => {
+  try {
+    const res = await fetch("/api/claude", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ system, user, max_tokens: maxTokens, model }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.text || null;
+  } catch (e) {
+    return null;
+  }
+};
+
+// Calls the /api/gemini proxy which uses Gemini image generation.
+// Returns { imageBase64, mimeType } on success, or null on failure.
+const callGemini = async (prompt) => {
+  try {
+    const res = await fetch("/api/gemini", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.imageBase64 ? data : null;
+  } catch (e) {
+    return null;
+  }
+};
+
 // ---------- Prompts ----------
 // Only experienceable non-embodied types.
 const genPiecesSystem = `You generate lesson building blocks for teachers. Given a subject and learning goal, output exactly 8 NON-EMBODIED lesson activities as JSON — traditional teaching formats where students sit, listen, read, watch, or write alone. ONLY use these five types: lecture, worksheet, video, quiz, reading, slide. Do NOT use discussion, group work, demo, or anything requiring another person. Do NOT include any activity where students move, gesture, or use their bodies. Each activity is 6-12 words, concrete to the subject. Mix the types. Return ONLY valid JSON, no prose, no markdown fences:
@@ -66,6 +99,19 @@ const expPrompts = {
 };
 
 const makeExpSystem = (type) => `You generate student-facing learning content for a live workshop. ${expPrompts[type]} Keep tone warm and grade-appropriate. No markdown, no prose outside JSON.`;
+
+// ---------- Visualization Prompts ----------
+
+const vizSlideSystem = `You are an expert in embodied cognition and learning design. Generate exactly 3 presentation slides that demonstrate an embodied learning transformation for an education research audience. Each slide has a clear before/after/why structure. Return ONLY valid JSON, no prose:
+{"slides":[
+  {"num":1,"label":"BEFORE","badge":"Non-Embodied 💺","title":"...","subtitle":"The Traditional Approach","bullets":["...","...","..."],"visualDesc":"one sentence describing an illustration for this slide"},
+  {"num":2,"label":"AFTER","badge":"Embodied 🤸","title":"...","subtitle":"The Embodied Transformation","bullets":["...","...","..."],"visualDesc":"one sentence describing a scene of students doing the activity"},
+  {"num":3,"label":"WHY","badge":"Research-Backed 🧠","title":"Why It Works","subtitle":"The Cognitive Science","bullets":["...","...","..."],"visualDesc":"one sentence describing a conceptual diagram of the cognitive mechanism"}
+]}
+Bullets are concrete and audience-ready (8-15 words each). No markdown inside strings.`;
+
+const vizCardSystem = `You are a learning design expert. Generate a compact scenario card for an embodied learning activity, for an audience of teachers and researchers. Return ONLY valid JSON, no prose:
+{"cardTitle":"...","scenario":"One sentence setting the scene — what the student does, where, and why (present tense).","steps":["Step 1: ...","Step 2: ...","Step 3: ...","Step 4: ..."],"bodyConnection":"One sentence on how the body movement connects to the abstract concept.","cognitiveRationale":"One sentence citing the core cognitive principle (e.g. embodied cognition, gesture-thought link, sensorimotor grounding).","researchTag":"e.g. 'Barsalou, 2008 — Grounded Cognition'"}`;
 
 // ---------- Helpers ----------
 const safeJSON = (txt) => {
@@ -515,6 +561,9 @@ export default function EmbodiedAiedStudio() {
             onRefresh={refreshNow} lessonsRef={lessonsRef} indexMapRef={indexMapRef}
           />
         )}
+        {view === "visualize" && (
+          <VisualizerView lessons={lessons} me={me} />
+        )}
         {view === "facilitator" && facilitatorMode && (
             <FacilitatorView
               lessons={lessons} setLessons={setLessons} me={me}
@@ -616,6 +665,7 @@ function Header({ view, setView, me, count, facilitatorMode, onTitleClick }) {
       <div style={{ display: "flex", gap: 8 }}>
         {tab("design", "Build", "✏️")}
         {tab("gallery", `Gallery ${count > 0 ? `· ${count}` : ""}`, "🎭")}
+        {tab("visualize", "Visualize", "🎨")}
         {facilitatorMode && tab("facilitator", "Debrief", "📊")}
       </div>
     </div>
@@ -4484,5 +4534,907 @@ async function seedExampleLessonIfMissing() {
     console.warn("Could not seed example lesson:", e);
     return false;
   }
+}
+
+// ============================================================
+// Visualizer — 3-slide deck + scenario card generator
+// ============================================================
+
+function VisualizerView({ lessons }) {
+  const [selectedLessonId, setSelectedLessonId] = useState("");
+  const [selectedPieceUid, setSelectedPieceUid] = useState("");
+  const [outputType, setOutputType] = useState("slides"); // "slides" | "card"
+  const [generating, setGenerating] = useState(false);
+  const [generatingImage, setGeneratingImage] = useState(false);
+  const [slides, setSlides] = useState(null);
+  const [card, setCard] = useState(null);
+  const [cardImage, setCardImage] = useState(null);
+  const [slideImages, setSlideImages] = useState([]);
+  const [currentSlide, setCurrentSlide] = useState(0);
+  const [error, setError] = useState("");
+
+  const selectedLesson = lessons.find((l) => l.id === selectedLessonId);
+
+  // Flatten all timeline activities from the selected lesson.
+  const allPieces = selectedLesson
+    ? [
+        ...(selectedLesson.timeline?.open || []),
+        ...(selectedLesson.timeline?.core || []),
+        ...(selectedLesson.timeline?.close || []),
+      ]
+    : [];
+
+  const selectedPiece = allPieces.find((p) => p.uid === selectedPieceUid);
+
+  const buildUserPrompt = () => {
+    if (!selectedLesson || !selectedPiece) return "";
+    const isEmb = !!selectedPiece.transformedTo;
+    const origTitle = selectedPiece.title || "activity";
+    const embTitle = selectedPiece.transformedTo?.title || origTitle;
+    const why = selectedPiece.transformedTo?.why || "";
+    return [
+      `Subject: ${selectedLesson.subject || "General"}`,
+      `Grade: ${selectedLesson.grade || "K-12"}`,
+      `Learning goal: ${selectedLesson.goal || "(not specified)"}`,
+      `Original non-embodied activity: "${origTitle}" (type: ${selectedPiece.type || "activity"})`,
+      isEmb
+        ? `Embodied transformation: "${embTitle}"${why ? `\nRationale: ${why}` : ""}`
+        : `Note: this activity has not been transformed yet — propose an embodied version.`,
+    ].join("\n");
+  };
+
+  const buildGeminiPrompt = (slideIndex) => {
+    if (!selectedLesson || !selectedPiece) return "";
+    const isEmb = !!selectedPiece.transformedTo;
+    const embTitle = isEmb
+      ? selectedPiece.transformedTo?.title
+      : selectedPiece.title;
+    if (slideIndex === 1 || slideIndex === "card") {
+      // After/card slide: show student performing the embodied activity.
+      return (
+        `Flat illustration, educational style, warm muted colors, simple clean lines. ` +
+        `A single student performing an embodied learning activity: "${embTitle}" ` +
+        `for ${selectedLesson.subject || "school"}, grade ${selectedLesson.grade || "K-12"}. ` +
+        `The student's body posture and gesture are clearly visible. No text. No background clutter. ` +
+        `Suitable for an academic conference slide.`
+      );
+    }
+    if (slideIndex === 2) {
+      // Why slide: abstract brain/body concept diagram.
+      return (
+        `Minimal flat illustration for a research presentation. ` +
+        `Abstract concept: connection between body movement and cognitive learning. ` +
+        `Show a stylized brain and body interacting. Warm muted palette. No text. Clean lines.`
+      );
+    }
+    // Slide 0 (Before): traditional classroom passive activity.
+    return (
+      `Flat illustration, educational style, warm muted colors. ` +
+      `A student sitting at a desk doing a passive activity: "${selectedPiece.title}". ` +
+      `Traditional classroom setting. Clean simple lines. No text.`
+    );
+  };
+
+  const generate = async () => {
+    if (!selectedLesson || !selectedPiece) return;
+    setError("");
+    setGenerating(true);
+    setSlides(null);
+    setCard(null);
+    setCardImage(null);
+    setSlideImages([]);
+    setCurrentSlide(0);
+
+    const userPrompt = buildUserPrompt();
+
+    if (outputType === "slides") {
+      const raw = await callClaudeModel(
+        vizSlideSystem,
+        userPrompt,
+        1200,
+        "claude-haiku-4-5-20251001"
+      );
+      const parsed = safeJSON(raw);
+      if (!parsed?.slides || !Array.isArray(parsed.slides)) {
+        setError("Could not generate slides — try again.");
+        setGenerating(false);
+        return;
+      }
+      setSlides(parsed.slides);
+      setGenerating(false);
+
+      // Generate Gemini images for each slide in the background.
+      setGeneratingImage(true);
+      const imgs = await Promise.all(
+        parsed.slides.map((_, i) => callGemini(buildGeminiPrompt(i)))
+      );
+      setSlideImages(imgs);
+      setGeneratingImage(false);
+    } else {
+      // Scenario card
+      const raw = await callClaudeModel(
+        vizCardSystem,
+        userPrompt,
+        800,
+        "claude-haiku-4-5-20251001"
+      );
+      const parsed = safeJSON(raw);
+      if (!parsed) {
+        setError("Could not generate card — try again.");
+        setGenerating(false);
+        return;
+      }
+      setCard(parsed);
+      setGenerating(false);
+
+      // Generate Gemini illustration.
+      setGeneratingImage(true);
+      const img = await callGemini(buildGeminiPrompt("card"));
+      setCardImage(img);
+      setGeneratingImage(false);
+    }
+  };
+
+  return (
+    <div style={{ paddingTop: 32 }}>
+      {/* Page header */}
+      <div style={{ marginBottom: 28 }}>
+        <h2
+          style={{
+            fontFamily: FD,
+            fontSize: 28,
+            fontWeight: 700,
+            margin: "0 0 6px",
+            letterSpacing: -0.5,
+          }}
+        >
+          🎨 Visualize Embodied Learning
+        </h2>
+        <p style={{ color: C.muted, fontSize: 14, margin: 0, lineHeight: 1.6 }}>
+          Pick a lesson activity and generate a{" "}
+          <strong>3-slide deck</strong> or a{" "}
+          <strong>scenario card</strong> — ready to drop into any presentation
+          to show where and how embodied learning fits.
+        </p>
+      </div>
+
+      {/* Controls panel */}
+      <div
+        style={{
+          background: C.cream,
+          border: `1.5px solid ${C.ink}`,
+          borderRadius: 16,
+          padding: "24px",
+          marginBottom: 28,
+          display: "flex",
+          flexDirection: "column",
+          gap: 18,
+        }}
+      >
+        {/* Step 1: lesson */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <label
+            style={{
+              fontFamily: FM,
+              fontSize: 10,
+              letterSpacing: 1,
+              color: C.muted,
+              textTransform: "uppercase",
+            }}
+          >
+            1 · Pick a Lesson
+          </label>
+          <select
+            value={selectedLessonId}
+            onChange={(e) => {
+              setSelectedLessonId(e.target.value);
+              setSelectedPieceUid("");
+              setSlides(null);
+              setCard(null);
+            }}
+            style={{
+              padding: "10px 14px",
+              fontSize: 14,
+              fontFamily: FB,
+              border: `1.5px solid ${C.ink}`,
+              borderRadius: 10,
+              background: C.paper,
+              outline: "none",
+              cursor: "pointer",
+              maxWidth: 480,
+            }}
+          >
+            <option value="">— select a lesson —</option>
+            {lessons.map((l) => (
+              <option key={l.id} value={l.id}>
+                {l.name || `${l.subject || "Lesson"} · ${l.authorName || "unknown"}`}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {/* Step 2: activity */}
+        {selectedLesson && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label
+              style={{
+                fontFamily: FM,
+                fontSize: 10,
+                letterSpacing: 1,
+                color: C.muted,
+                textTransform: "uppercase",
+              }}
+            >
+              2 · Pick an Activity
+            </label>
+            <select
+              value={selectedPieceUid}
+              onChange={(e) => {
+                setSelectedPieceUid(e.target.value);
+                setSlides(null);
+                setCard(null);
+              }}
+              style={{
+                padding: "10px 14px",
+                fontSize: 14,
+                fontFamily: FB,
+                border: `1.5px solid ${C.ink}`,
+                borderRadius: 10,
+                background: C.paper,
+                outline: "none",
+                cursor: "pointer",
+                maxWidth: 480,
+              }}
+            >
+              <option value="">— select an activity —</option>
+              {allPieces.map((p) => (
+                <option key={p.uid} value={p.uid}>
+                  {p.transformedTo ? "🤸 " : "💺 "}
+                  {p.title}
+                  {p.transformedTo ? ` → ${p.transformedTo.title}` : ""}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        {/* Step 3: output format */}
+        {selectedPiece && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label
+              style={{
+                fontFamily: FM,
+                fontSize: 10,
+                letterSpacing: 1,
+                color: C.muted,
+                textTransform: "uppercase",
+              }}
+            >
+              3 · Output Format
+            </label>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              {[
+                {
+                  id: "slides",
+                  label: "🖼️  3-Slide Deck",
+                  desc: "Claude (Haiku) · structured slides",
+                },
+                {
+                  id: "card",
+                  label: "🃏  Scenario Card",
+                  desc: "Claude + Gemini illustration",
+                },
+              ].map((opt) => (
+                <button
+                  key={opt.id}
+                  onClick={() => setOutputType(opt.id)}
+                  style={{
+                    flex: "1 1 180px",
+                    padding: "12px 16px",
+                    textAlign: "left",
+                    background: outputType === opt.id ? C.ink : C.paper,
+                    color: outputType === opt.id ? C.paper : C.ink,
+                    border: `1.5px solid ${C.ink}`,
+                    borderRadius: 10,
+                    cursor: "pointer",
+                    fontFamily: FB,
+                  }}
+                >
+                  <div style={{ fontSize: 14, fontWeight: 600 }}>
+                    {opt.label}
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 10,
+                      opacity: 0.65,
+                      marginTop: 3,
+                      fontFamily: FM,
+                      letterSpacing: 0.5,
+                    }}
+                  >
+                    {opt.desc}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {selectedPiece && (
+          <button
+            onClick={generate}
+            disabled={generating}
+            style={{
+              padding: "13px 28px",
+              background: generating ? C.muted : C.coral,
+              color: "white",
+              border: "none",
+              borderRadius: 10,
+              fontFamily: FD,
+              fontSize: 16,
+              fontWeight: 600,
+              cursor: generating ? "not-allowed" : "pointer",
+              alignSelf: "flex-start",
+            }}
+          >
+            {generating
+              ? "Generating…"
+              : `Generate ${outputType === "slides" ? "Slide Deck" : "Scenario Card"} →`}
+          </button>
+        )}
+
+        {error && (
+          <div
+            style={{ color: C.coral, fontFamily: FM, fontSize: 12, letterSpacing: 0.3 }}
+          >
+            ⚠ {error}
+          </div>
+        )}
+      </div>
+
+      {/* Output */}
+      {slides && outputType === "slides" && (
+        <SlideView
+          slides={slides}
+          images={slideImages}
+          generatingImages={generatingImage}
+          currentSlide={currentSlide}
+          setCurrentSlide={setCurrentSlide}
+          lesson={selectedLesson}
+        />
+      )}
+
+      {card && outputType === "card" && (
+        <ScenarioCardView
+          card={card}
+          image={cardImage}
+          generatingImage={generatingImage}
+          lesson={selectedLesson}
+          piece={selectedPiece}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---- 3-Slide Deck ----
+function SlideView({
+  slides,
+  images,
+  generatingImages,
+  currentSlide,
+  setCurrentSlide,
+  lesson,
+}) {
+  const s = slides[currentSlide] || slides[0];
+  const img = images[currentSlide] || null;
+
+  // Per-slide color palette
+  const palette = [
+    { bg: "#eef2ff", accent: "#4a6cf7", ring: "#c7d2fe" },
+    { bg: "#ecfdf5", accent: "#059669", ring: "#a7f3d0" },
+    { bg: "#fffbeb", accent: "#d97706", ring: "#fde68a" },
+  ];
+  const col = palette[currentSlide] || palette[0];
+
+  return (
+    <div>
+      {/* Context bar */}
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          marginBottom: 10,
+          fontFamily: FM,
+          fontSize: 10,
+          color: C.muted,
+          letterSpacing: 0.8,
+        }}
+      >
+        <span>
+          {(lesson?.subject || "").toUpperCase()}
+          {lesson?.grade ? ` · ${lesson.grade.toUpperCase()}` : ""}
+        </span>
+        <span>
+          {currentSlide + 1} / {slides.length}
+        </span>
+      </div>
+
+      {/* Slide */}
+      <div
+        style={{
+          background: col.bg,
+          border: `2px solid ${col.accent}`,
+          borderRadius: 20,
+          padding: "36px 40px",
+          minHeight: 340,
+          position: "relative",
+          boxShadow: `0 8px 32px -8px ${col.accent}55`,
+        }}
+      >
+        {/* Badge */}
+        <div
+          style={{
+            position: "absolute",
+            top: 18,
+            right: 22,
+            background: col.accent,
+            color: "white",
+            padding: "4px 14px",
+            borderRadius: 20,
+            fontFamily: FM,
+            fontSize: 10,
+            letterSpacing: 0.8,
+            textTransform: "uppercase",
+          }}
+        >
+          {s.badge || s.label}
+        </div>
+
+        <div
+          style={{ display: "flex", gap: 32, alignItems: "flex-start" }}
+        >
+          {/* Text column */}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div
+              style={{
+                fontFamily: FM,
+                fontSize: 9,
+                color: col.accent,
+                letterSpacing: 2,
+                marginBottom: 6,
+                textTransform: "uppercase",
+              }}
+            >
+              Slide {s.num || currentSlide + 1} of {slides.length}
+            </div>
+            <h3
+              style={{
+                fontFamily: FD,
+                fontSize: 26,
+                fontWeight: 700,
+                margin: "0 0 6px",
+                letterSpacing: -0.5,
+                color: C.ink,
+                lineHeight: 1.15,
+              }}
+            >
+              {s.title}
+            </h3>
+            <div
+              style={{
+                fontFamily: FB,
+                fontSize: 13,
+                color: C.muted,
+                margin: "0 0 20px",
+              }}
+            >
+              {s.subtitle}
+            </div>
+            <ul
+              style={{
+                margin: 0,
+                padding: "0 0 0 18px",
+                display: "flex",
+                flexDirection: "column",
+                gap: 10,
+              }}
+            >
+              {(s.bullets || []).map((b, i) => (
+                <li
+                  key={i}
+                  style={{
+                    fontFamily: FB,
+                    fontSize: 14,
+                    lineHeight: 1.55,
+                    color: C.ink,
+                  }}
+                >
+                  {b}
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          {/* Image panel */}
+          <div
+            style={{
+              width: 196,
+              flexShrink: 0,
+              background: col.ring + "66",
+              border: `1.5px dashed ${col.accent}88`,
+              borderRadius: 14,
+              minHeight: 160,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              overflow: "hidden",
+            }}
+          >
+            {img ? (
+              <img
+                src={`data:${img.mimeType};base64,${img.imageBase64}`}
+                alt="AI illustration"
+                style={{
+                  width: "100%",
+                  height: "100%",
+                  objectFit: "cover",
+                  borderRadius: 12,
+                }}
+              />
+            ) : (
+              <div
+                style={{
+                  padding: 16,
+                  textAlign: "center",
+                  fontFamily: FM,
+                  fontSize: 10,
+                  color: col.accent + "bb",
+                  letterSpacing: 0.5,
+                  lineHeight: 1.6,
+                }}
+              >
+                {generatingImages ? (
+                  <span>✦ Gemini is drawing…</span>
+                ) : (
+                  <span style={{ fontStyle: "italic", opacity: 0.7 }}>
+                    {s.visualDesc}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Navigation */}
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          marginTop: 16,
+        }}
+      >
+        <button
+          onClick={() => setCurrentSlide(Math.max(0, currentSlide - 1))}
+          disabled={currentSlide === 0}
+          style={{
+            padding: "10px 22px",
+            fontFamily: FB,
+            fontSize: 14,
+            background: currentSlide === 0 ? C.paperDeep : C.ink,
+            color: currentSlide === 0 ? C.muted : C.paper,
+            border: "none",
+            borderRadius: 10,
+            cursor: currentSlide === 0 ? "default" : "pointer",
+          }}
+        >
+          ← Previous
+        </button>
+
+        <div style={{ display: "flex", gap: 8 }}>
+          {slides.map((_, i) => (
+            <button
+              key={i}
+              onClick={() => setCurrentSlide(i)}
+              style={{
+                width: 10,
+                height: 10,
+                borderRadius: "50%",
+                border: "none",
+                background: i === currentSlide ? C.coral : C.paperDeep,
+                cursor: "pointer",
+                padding: 0,
+              }}
+            />
+          ))}
+        </div>
+
+        <button
+          onClick={() =>
+            setCurrentSlide(Math.min(slides.length - 1, currentSlide + 1))
+          }
+          disabled={currentSlide === slides.length - 1}
+          style={{
+            padding: "10px 22px",
+            fontFamily: FB,
+            fontSize: 14,
+            background:
+              currentSlide === slides.length - 1 ? C.paperDeep : C.coral,
+            color:
+              currentSlide === slides.length - 1 ? C.muted : "white",
+            border: "none",
+            borderRadius: 10,
+            cursor:
+              currentSlide === slides.length - 1 ? "default" : "pointer",
+          }}
+        >
+          Next →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---- Scenario Card ----
+function ScenarioCardView({ card, image, generatingImage, lesson, piece }) {
+  return (
+    <div
+      style={{
+        maxWidth: 560,
+        border: `2px solid ${C.ink}`,
+        borderRadius: 20,
+        overflow: "hidden",
+        boxShadow: `0 12px 40px -12px ${C.ink}44`,
+      }}
+    >
+      {/* Illustration area */}
+      <div
+        style={{
+          height: 240,
+          background: C.paperDeep,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          position: "relative",
+          overflow: "hidden",
+        }}
+      >
+        {image ? (
+          <img
+            src={`data:${image.mimeType};base64,${image.imageBase64}`}
+            alt="Embodied scenario illustration"
+            style={{ width: "100%", height: "100%", objectFit: "cover" }}
+          />
+        ) : (
+          <div
+            style={{
+              textAlign: "center",
+              color: C.muted,
+              fontFamily: FM,
+              fontSize: 11,
+              letterSpacing: 0.5,
+            }}
+          >
+            {generatingImage
+              ? "✦ Gemini is illustrating…"
+              : "🎨 Add GEMINI_API_KEY to enable illustrations"}
+          </div>
+        )}
+
+        {/* Overlaid badges */}
+        <div
+          style={{
+            position: "absolute",
+            top: 14,
+            left: 14,
+            background: C.coral,
+            color: "white",
+            padding: "4px 14px",
+            borderRadius: 20,
+            fontFamily: FM,
+            fontSize: 10,
+            letterSpacing: 0.8,
+            textTransform: "uppercase",
+          }}
+        >
+          🤸 Embodied Learning
+        </div>
+        {(lesson?.subject || lesson?.grade) && (
+          <div
+            style={{
+              position: "absolute",
+              top: 14,
+              right: 14,
+              background: C.ink + "cc",
+              color: C.paper,
+              padding: "4px 12px",
+              borderRadius: 20,
+              fontFamily: FM,
+              fontSize: 10,
+              letterSpacing: 0.4,
+            }}
+          >
+            {[lesson?.subject, lesson?.grade].filter(Boolean).join(" · ")}
+          </div>
+        )}
+      </div>
+
+      {/* Card body */}
+      <div style={{ padding: "24px 28px", background: C.cream }}>
+        <h3
+          style={{
+            fontFamily: FD,
+            fontSize: 22,
+            fontWeight: 700,
+            margin: "0 0 6px",
+            letterSpacing: -0.3,
+          }}
+        >
+          {card.cardTitle}
+        </h3>
+        <p
+          style={{
+            fontFamily: FB,
+            fontSize: 13,
+            color: C.muted,
+            margin: "0 0 18px",
+            lineHeight: 1.6,
+          }}
+        >
+          {card.scenario}
+        </p>
+
+        {/* Steps */}
+        {(card.steps || []).length > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            <div
+              style={{
+                fontFamily: FM,
+                fontSize: 9,
+                letterSpacing: 1.5,
+                color: C.coral,
+                textTransform: "uppercase",
+                marginBottom: 8,
+              }}
+            >
+              Activity Steps
+            </div>
+            {(card.steps || []).map((step, i) => (
+              <div
+                key={i}
+                style={{
+                  display: "flex",
+                  gap: 10,
+                  alignItems: "flex-start",
+                  padding: "7px 0",
+                  borderBottom: `1px solid ${C.paperDeep}`,
+                }}
+              >
+                <span
+                  style={{
+                    background: C.coral,
+                    color: "white",
+                    borderRadius: "50%",
+                    width: 20,
+                    height: 20,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    fontFamily: FM,
+                    fontSize: 10,
+                    fontWeight: 700,
+                    flexShrink: 0,
+                    marginTop: 1,
+                  }}
+                >
+                  {i + 1}
+                </span>
+                <span
+                  style={{
+                    fontFamily: FB,
+                    fontSize: 13,
+                    lineHeight: 1.55,
+                    color: C.ink,
+                  }}
+                >
+                  {step}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Body connection */}
+        {card.bodyConnection && (
+          <div
+            style={{
+              background: C.sage + "22",
+              border: `1px solid ${C.sage}`,
+              borderRadius: 10,
+              padding: "10px 14px",
+              marginBottom: 10,
+            }}
+          >
+            <div
+              style={{
+                fontFamily: FM,
+                fontSize: 9,
+                letterSpacing: 1,
+                color: C.sage,
+                textTransform: "uppercase",
+                marginBottom: 4,
+              }}
+            >
+              Body Connection
+            </div>
+            <div
+              style={{
+                fontFamily: FB,
+                fontSize: 13,
+                color: C.ink,
+                lineHeight: 1.55,
+              }}
+            >
+              {card.bodyConnection}
+            </div>
+          </div>
+        )}
+
+        {/* Cognitive rationale */}
+        {card.cognitiveRationale && (
+          <div
+            style={{
+              background: C.mustard + "22",
+              border: `1px solid ${C.mustard}`,
+              borderRadius: 10,
+              padding: "10px 14px",
+              marginBottom: 10,
+            }}
+          >
+            <div
+              style={{
+                fontFamily: FM,
+                fontSize: 9,
+                letterSpacing: 1,
+                color: C.mustard,
+                textTransform: "uppercase",
+                marginBottom: 4,
+              }}
+            >
+              Cognitive Science
+            </div>
+            <div
+              style={{
+                fontFamily: FB,
+                fontSize: 13,
+                color: C.ink,
+                lineHeight: 1.55,
+              }}
+            >
+              {card.cognitiveRationale}
+            </div>
+          </div>
+        )}
+
+        {/* Research tag */}
+        {card.researchTag && (
+          <div
+            style={{
+              fontFamily: FM,
+              fontSize: 10,
+              color: C.muted,
+              letterSpacing: 0.4,
+              marginTop: 4,
+            }}
+          >
+            📚 {card.researchTag}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
