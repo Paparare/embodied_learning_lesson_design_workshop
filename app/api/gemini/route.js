@@ -66,7 +66,9 @@ export async function POST(req) {
         body: JSON.stringify({
           contents: [{ parts: [{ text: safePrompt }] }],
           generationConfig: {
-            responseModalities: ["IMAGE"],
+            // Must include TEXT — the model returns text alongside the image.
+            // Using ["IMAGE"] alone causes the API to return no candidates.
+            responseModalities: ["TEXT", "IMAGE"],
           },
         }),
       }

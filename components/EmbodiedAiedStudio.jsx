@@ -5801,7 +5801,7 @@ function ScenarioCardView({ card, image, generatingImage, lesson, piece }) {
           >
             {generatingImage
               ? "✦ Gemini is illustrating…"
-              : "🎨 Add GEMINI_API_KEY to enable illustrations"}
+              : "🎨 Illustration unavailable — check /api/test-gemini"}
           </div>
         )}
 
