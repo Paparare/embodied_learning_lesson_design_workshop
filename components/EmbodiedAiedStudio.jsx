@@ -4894,7 +4894,7 @@ function VisualizerView({ lessons }) {
 
       {/* Output */}
       {slides && outputType === "slides" && (
-        <SlideView
+        <VizSlideDeckView
           slides={slides}
           images={slideImages}
           generatingImages={generatingImage}
@@ -4917,8 +4917,8 @@ function VisualizerView({ lessons }) {
   );
 }
 
-// ---- 3-Slide Deck ----
-function SlideView({
+// ---- 3-Slide Deck (Visualizer) ----
+function VizSlideDeckView({
   slides,
   images,
   generatingImages,
