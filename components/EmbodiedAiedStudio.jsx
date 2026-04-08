@@ -684,7 +684,8 @@ function Designer({ me, lessons, setLessons, setView }) {
   // Pre-generated content: map of pieceUid -> { type, data }
   const [generatedContent, setGeneratedContent] = useState({});
   const [generatingAll, setGeneratingAll] = useState(false);
-  const [regenerating, setRegenerating] = useState({}); // uid -> bool
+  const [regenerating, setRegenerating] = useState({});    // uid -> bool  (content)
+  const [regeneratingViz, setRegeneratingViz] = useState({}); // uid -> bool  (visual)
   const [generatedViz, setGeneratedViz] = useState({}); // uid -> { format, slides?, card?, slideImages?, cardImage? }
   // Snapshot of the original AI-generated pieces (for facilitator walkthrough).
   // Captured once at generate time; never mutated, even as teacher edits.
@@ -904,8 +905,9 @@ function Designer({ me, lessons, setLessons, setView }) {
     setGeneratingAll(true);
     setStage("review");
 
-    // ── Phase 1: learning content ──────────────────────────────────────────────
-    // Skip pieces that already have content so edits survive a back-and-forth.
+    // Generate learning content only — visualizations are on-demand via
+    // the "Generate Visual" button on each piece card so the designer can
+    // finish editing first.
     const toGenerate = all.filter(p => !generatedContent[p.uid]);
     if (toGenerate.length > 0) {
       await parallelMapLimit(toGenerate, 3, async (p) => {
@@ -916,39 +918,24 @@ function Designer({ me, lessons, setLessons, setView }) {
       });
     }
 
-    // ── Phase 2: visualizations ────────────────────────────────────────────────
-    // Run AFTER content so Claude/Gemini aren't hit with doubled concurrent load.
-    // Also catches pieces that already had content but never got a viz (e.g. the
-    // teacher navigated away and came back — the early-exit above would have
-    // skipped them entirely in the old code).
-    const toVisualize = all.filter(p => !generatedViz[p.uid]);
-    if (toVisualize.length > 0) {
-      await parallelMapLimit(toVisualize, 2, async (p) => {
-        const viz = await generateVizForPiece(p);
-        if (viz) {
-          setGeneratedViz(prev => ({ ...prev, [p.uid]: viz }));
-        }
-      });
-    }
-
     setGeneratingAll(false);
   };
 
-  // Regenerate a single piece (from review screen).
-  // Refreshes both learning content AND visualization so they stay in sync.
-  // Content and viz run sequentially (not parallel) to avoid doubling API load
-  // when multiple teachers regenerate at the same time.
+  // Regenerate learning content only for a single piece.
   const regenerateOne = async (piece) => {
     setRegenerating(r => ({ ...r, [piece.uid]: true }));
     const result = await generateContentForPiece(piece);
-    if (result) {
-      setGeneratedContent(c => ({ ...c, [piece.uid]: result }));
-    }
-    const viz = await generateVizForPiece(piece);
-    if (viz) {
-      setGeneratedViz(v => ({ ...v, [piece.uid]: viz }));
-    }
+    if (result) setGeneratedContent(c => ({ ...c, [piece.uid]: result }));
     setRegenerating(r => ({ ...r, [piece.uid]: false }));
+  };
+
+  // Regenerate (or generate for the first time) the visualization for a single piece.
+  // Called by both the "Generate Visual" button (first run) and "↻ Visual" (re-run).
+  const regenerateVizOne = async (piece) => {
+    setRegeneratingViz(r => ({ ...r, [piece.uid]: true }));
+    const viz = await generateVizForPiece(piece);
+    if (viz) setGeneratedViz(v => ({ ...v, [piece.uid]: viz }));
+    setRegeneratingViz(r => ({ ...r, [piece.uid]: false }));
   };
 
   // Generate a visualization (slide deck or scenario card) for a single piece.
@@ -1082,7 +1069,7 @@ function Designer({ me, lessons, setLessons, setView }) {
     setPieces([]); setTimeline({ open: [], core: [], close: [] });
     setOriginalPieces([]);
     setPublished(false); setDebrief("");
-    setGeneratedContent({}); setGeneratingAll(false); setRegenerating({});
+    setGeneratedContent({}); setGeneratingAll(false); setRegenerating({}); setRegeneratingViz({});
     setGeneratedViz({});
   };
 
@@ -1111,7 +1098,9 @@ function Designer({ me, lessons, setLessons, setView }) {
         generatedViz={generatedViz}
         generatingAll={generatingAll}
         regenerating={regenerating}
+        regeneratingViz={regeneratingViz}
         onRegenerate={regenerateOne}
+        onRegenerateViz={regenerateVizOne}
         onUpdate={updateContent}
         onBack={() => setStage("assemble")}
         onPublish={publish}
@@ -1197,8 +1186,8 @@ function Designer({ me, lessons, setLessons, setView }) {
 // ============================================================
 function ReviewStage({
   me, subject, grade, goal, timeline,
-  generatedContent, generatedViz, generatingAll, regenerating,
-  onRegenerate, onUpdate, onBack, onPublish,
+  generatedContent, generatedViz, generatingAll, regenerating, regeneratingViz,
+  onRegenerate, onRegenerateViz, onUpdate, onBack, onPublish,
   published, debrief, onReset, onGoToGallery,
   embodiedCount, totalCount,
 }) {
@@ -1268,8 +1257,10 @@ function ReviewStage({
             content={generatedContent[p.uid]}
             viz={generatedViz ? generatedViz[p.uid] : null}
             isRegenerating={!!regenerating[p.uid]}
+            isRegeneratingViz={!!regeneratingViz[p.uid]}
             isLoadingAll={generatingAll && !generatedContent[p.uid]}
             onRegenerate={() => onRegenerate(p)}
+            onRegenerateViz={() => onRegenerateViz(p)}
             onUpdate={(data) => onUpdate(p.uid, data)}
             locked={published}
             lessonContext={{ subject, grade, goal }}
@@ -1342,7 +1333,7 @@ function ReviewStage({
 // ============================================================
 // Review Piece Card — shows generated content, allows edit/regen
 // ============================================================
-function ReviewPieceCard({ idx, piece, content, viz, isRegenerating, isLoadingAll, onRegenerate, onUpdate, locked, lessonContext }) {
+function ReviewPieceCard({ idx, piece, content, viz, isRegenerating, isRegeneratingViz, isLoadingAll, onRegenerate, onRegenerateViz, onUpdate, locked, lessonContext }) {
   const isEmbodied = !!piece.transformedTo;
   const borderColor = isEmbodied ? C.coral : C.ink;
   const [slideIdx, setSlideIdx] = useState(0);
@@ -1371,14 +1362,41 @@ function ReviewPieceCard({ idx, piece, content, viz, isRegenerating, isLoadingAl
           </div>
         </div>
         {!locked && (
-          <button onClick={onRegenerate} disabled={isRegenerating || isLoadingAll} style={{
-            background: "transparent", border: `1.5px solid ${C.coral}`, color: C.coral,
-            padding: "6px 14px", borderRadius: 20, fontFamily: FM, fontSize: 10,
-            letterSpacing: 0.5, cursor: (isRegenerating || isLoadingAll) ? "wait" : "pointer",
-            textTransform: "uppercase", fontWeight: 600, whiteSpace: "nowrap",
-          }}>
-            {isRegenerating ? "…" : "↻ Regenerate"}
-          </button>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+            {/* ↻ Content */}
+            <button
+              onClick={onRegenerate}
+              disabled={isRegenerating || isLoadingAll}
+              title="Regenerate the learning content for this activity"
+              style={{
+                background: "transparent", border: `1.5px solid ${C.ink}`, color: C.ink,
+                padding: "5px 12px", borderRadius: 20, fontFamily: FM, fontSize: 10,
+                letterSpacing: 0.5, cursor: (isRegenerating || isLoadingAll) ? "wait" : "pointer",
+                textTransform: "uppercase", fontWeight: 600, whiteSpace: "nowrap",
+                opacity: (isRegenerating || isLoadingAll) ? 0.5 : 1,
+              }}
+            >
+              {isRegenerating ? "…" : "↻ Content"}
+            </button>
+            {/* Generate Visual / ↻ Visual */}
+            <button
+              onClick={onRegenerateViz}
+              disabled={isRegeneratingViz || isLoadingAll}
+              title={viz ? "Regenerate the visualization" : "Generate a slide deck or scenario card for this activity"}
+              style={{
+                background: isRegeneratingViz ? C.muted : viz ? "transparent" : C.coral,
+                border: `1.5px solid ${viz ? C.coral : C.coral}`,
+                color: viz ? C.coral : "white",
+                padding: "5px 12px", borderRadius: 20, fontFamily: FM, fontSize: 10,
+                letterSpacing: 0.5, cursor: (isRegeneratingViz || isLoadingAll) ? "wait" : "pointer",
+                textTransform: "uppercase", fontWeight: 600, whiteSpace: "nowrap",
+                opacity: (isRegeneratingViz || isLoadingAll) ? 0.6 : 1,
+                transition: "all 0.15s",
+              }}
+            >
+              {isRegeneratingViz ? "✦ Generating…" : viz ? "↻ Visual" : "🎨 Generate Visual"}
+            </button>
+          </div>
         )}
       </div>
 
@@ -1419,8 +1437,18 @@ function ReviewPieceCard({ idx, piece, content, viz, isRegenerating, isLoadingAl
         </div>
       )}
 
-      {/* ── Inline visualization (auto-generated alongside content) ── */}
-      {viz ? (
+      {/* ── Visualization section ── */}
+      {isRegeneratingViz ? (
+        <div style={{
+          marginTop: 20, borderTop: `1.5px dashed ${isEmbodied ? C.coral + "55" : C.muted + "44"}`,
+          paddingTop: 16, display: "flex", alignItems: "center", gap: 8,
+          fontFamily: FM, fontSize: 10, color: C.muted, letterSpacing: 0.8,
+          textTransform: "uppercase",
+        }}>
+          <span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>✦</span>
+          <span>Generating {isEmbodied ? "scenario card" : "slide deck"}…</span>
+        </div>
+      ) : viz ? (
         <div style={{
           marginTop: 20,
           borderTop: `1.5px dashed ${isEmbodied ? C.coral + "66" : C.muted + "55"}`,
@@ -1452,16 +1480,6 @@ function ReviewPieceCard({ idx, piece, content, viz, isRegenerating, isLoadingAl
               lesson={lessonContext}
             />
           ) : null}
-        </div>
-      ) : isLoadingAll ? (
-        <div style={{
-          marginTop: 16, padding: "10px 16px",
-          borderTop: `1.5px dashed ${C.muted + "44"}`,
-          fontFamily: FM, fontSize: 10, color: C.muted,
-          letterSpacing: 0.5, textTransform: "uppercase",
-          display: "flex", alignItems: "center", gap: 6,
-        }}>
-          <span style={{ opacity: 0.5 }}>🎨 Generating visualization…</span>
         </div>
       ) : null}
     </div>
@@ -2060,12 +2078,11 @@ function ContentEditor({ type, data, onChange, locked }) {
 
   if (type === "embodied") {
     const steps = data.steps || [];
+    const updateSteps = (next) => onChange({ ...data, steps: next });
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         {steps.map((s, i) => locked ? (
-          <div key={i} style={{
-            display: "flex", gap: 10, fontSize: 14, padding: "6px 0",
-          }}>
+          <div key={i} style={{ display: "flex", gap: 10, fontSize: 14, padding: "6px 0" }}>
             <span style={{
               fontFamily: FM, fontSize: 12, color: C.coral, fontWeight: 700, minWidth: 20,
             }}>{i + 1}.</span>
@@ -2076,21 +2093,46 @@ function ContentEditor({ type, data, onChange, locked }) {
             <span style={{
               fontFamily: FM, fontSize: 12, color: C.coral, fontWeight: 700, minWidth: 20,
             }}>{i + 1}.</span>
-            <input value={s} onChange={(e) => {
-              const ns = [...steps]; ns[i] = e.target.value;
-              onChange({ ...data, steps: ns });
-            }} style={fieldStyle} />
+            <input
+              value={s}
+              onChange={(e) => {
+                const ns = [...steps]; ns[i] = e.target.value;
+                updateSteps(ns);
+              }}
+              style={{ ...fieldStyle, flex: 1 }}
+            />
+            {steps.length > 1 && (
+              <button
+                onClick={() => updateSteps(steps.filter((_, k) => k !== i))}
+                title="Remove this step"
+                style={{
+                  background: "transparent", color: C.muted, border: "none",
+                  cursor: "pointer", fontSize: 18, padding: "0 6px", lineHeight: 1,
+                  flexShrink: 0,
+                }}
+              >×</button>
+            )}
           </div>
         ))}
+        {!locked && steps.length < 10 && (
+          <button
+            onClick={() => updateSteps([...steps, ""])}
+            style={{
+              alignSelf: "flex-start", background: "transparent", color: C.coral,
+              border: `1px dashed ${C.coral}`, padding: "4px 12px", borderRadius: 10,
+              fontFamily: FM, fontSize: 10, letterSpacing: 0.5, cursor: "pointer",
+              textTransform: "uppercase", marginTop: 2,
+            }}
+          >+ add step</button>
+        )}
         <div style={{
           background: C.coral + "15", border: `1px dashed ${C.coral}`, borderRadius: 10,
           padding: "10px 14px", marginTop: 6,
         }}>
           <div style={{
-            fontFamily: FM, fontSize: 10, color: C.coral, letterSpacing: 1, textTransform: "uppercase", marginBottom: 4,
-          }}>
-            What to notice
-          </div>
+            fontFamily: FM, fontSize: 10, color: C.coral, letterSpacing: 1,
+            textTransform: "uppercase", marginBottom: 4,
+          }}>What to notice</div>
           {locked ? (
             <div style={{ fontSize: 13, fontStyle: "italic" }}>{data.notice}</div>
           ) : (

@@ -1,6 +1,9 @@
 // Debug endpoint — visit /api/test-gemini in browser to diagnose Gemini issues.
 // Tests the active model and reports the exact error from Google's API.
 
+// Prevent Next.js from trying to statically pre-render this GET route at build
+// time — it makes live API calls and must only run on actual requests.
+export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
 const MODELS_TO_TRY = [
