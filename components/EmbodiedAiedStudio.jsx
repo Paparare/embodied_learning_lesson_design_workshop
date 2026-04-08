@@ -561,9 +561,6 @@ export default function EmbodiedAiedStudio() {
             onRefresh={refreshNow} lessonsRef={lessonsRef} indexMapRef={indexMapRef}
           />
         )}
-        {view === "visualize" && (
-          <VisualizerView lessons={lessons} me={me} />
-        )}
         {view === "facilitator" && facilitatorMode && (
             <FacilitatorView
               lessons={lessons} setLessons={setLessons} me={me}
@@ -665,7 +662,6 @@ function Header({ view, setView, me, count, facilitatorMode, onTitleClick }) {
       <div style={{ display: "flex", gap: 8 }}>
         {tab("design", "Build", "✏️")}
         {tab("gallery", `Gallery ${count > 0 ? `· ${count}` : ""}`, "🎭")}
-        {tab("visualize", "Visualize", "🎨")}
         {facilitatorMode && tab("facilitator", "Debrief", "📊")}
       </div>
     </div>
@@ -2702,6 +2698,47 @@ function GalleryCard({ lesson, me, onOpen, onPlay, onStar, onDelete }) {
             background: `linear-gradient(90deg, ${C.sage}, ${C.coral})`,
           }} />
         </div>
+
+        {/* Activity strip — visual timeline of lesson activities */}
+        {(() => {
+          const acts = [
+            ...(lesson.timeline?.open || []),
+            ...(lesson.timeline?.core || []),
+            ...(lesson.timeline?.close || []),
+          ];
+          if (acts.length === 0) return null;
+          return (
+            <div style={{ marginBottom: 12 }}>
+              <div style={{
+                fontFamily: FM, fontSize: 9, letterSpacing: 1, color: C.muted,
+                textTransform: "uppercase", marginBottom: 5,
+              }}>Activities</div>
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                {acts.map((p, i) => {
+                  const isEmb = !!p.transformedTo;
+                  return (
+                    <div
+                      key={p.uid || i}
+                      title={isEmb ? `🤸 ${p.transformedTo?.title || p.title}\n(was: ${p.title})` : p.title}
+                      style={{
+                        background: isEmb ? C.coral + "18" : C.paperDeep,
+                        border: `1px solid ${isEmb ? C.coral + "88" : C.muted + "55"}`,
+                        borderRadius: 20, padding: "3px 8px",
+                        fontFamily: FM, fontSize: 9, letterSpacing: 0.2,
+                        color: isEmb ? C.coral : C.muted,
+                        maxWidth: 130, overflow: "hidden",
+                        textOverflow: "ellipsis", whiteSpace: "nowrap",
+                        cursor: "default",
+                      }}
+                    >
+                      {isEmb ? "🤸" : (p.icon || "📌")} {isEmb ? (p.transformedTo?.title || p.title) : p.title}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
       </div>
       <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
         <button onClick={onPlay} style={{
@@ -2774,14 +2811,369 @@ function GalleryCard({ lesson, me, onOpen, onPlay, onStar, onDelete }) {
 }
 
 // ============================================================
+// Visual-need evaluator — heuristic per activity
+// Returns { format: "slides"|"card", priority: "high"|"medium"|"low", reason }
+// ============================================================
+function recommendViz(piece) {
+  const isEmb = !!piece.transformedTo;
+  const type  = piece.type || "";
+
+  if (isEmb) {
+    return {
+      format: "card",
+      priority: "high",
+      badge: "🃏 Scenario card",
+      reason: "Embodied activity — a scenario card illustrates the body action and cognitive rationale best.",
+    };
+  }
+  if (["lecture", "reading", "video"].includes(type)) {
+    return {
+      format: "slides",
+      priority: "high",
+      badge: "🖼️ Slide deck",
+      reason: "Abstract/content-heavy — a Before / After / Why slide deck shows the embodied potential most clearly.",
+    };
+  }
+  if (type === "slide") {
+    return {
+      format: "slides",
+      priority: "medium",
+      badge: "🖼️ Slide deck",
+      reason: "Already visual — a slide deck can show how it could be further embodied.",
+    };
+  }
+  // worksheet, quiz, other
+  return {
+    format: "slides",
+    priority: "medium",
+    badge: "🖼️ Slide deck",
+    reason: "A slide deck is the clearest way to compare the original and an embodied version.",
+  };
+}
+
+// ============================================================
+// Lesson Visualizer Panel — embedded inside LessonModal
+// Lets the reviewer generate a slide deck or scenario card
+// for any activity in the lesson without leaving the modal.
+// trigger = { uid, format, ts } — set from outside to auto-fire.
+// ============================================================
+function LessonVisualizerPanel({ lesson, trigger }) {
+  // Start open if a trigger is already present (auto-fired from parent on mount).
+  const [open, setOpen] = useState(!!trigger);
+  const [selectedUid, setSelectedUid] = useState("");
+  const [outputType, setOutputType] = useState("slides");
+  const [generating, setGenerating] = useState(false);
+  const [generatingImage, setGeneratingImage] = useState(false);
+  const [slides, setSlides] = useState(null);
+  const [card, setCard] = useState(null);
+  const [cardImage, setCardImage] = useState(null);
+  const [slideImages, setSlideImages] = useState([]);
+  const [currentSlide, setCurrentSlide] = useState(0);
+  const [error, setError] = useState("");
+  // Track which trigger ts we last processed to avoid double-fire.
+  const lastTriggerTs = useRef(null);
+
+  // When parent fires a trigger (button click on an activity row):
+  // auto-open, pre-select, pre-set format, then generate.
+  useEffect(() => {
+    if (!trigger || trigger.ts === lastTriggerTs.current) return;
+    lastTriggerTs.current = trigger.ts;
+    // Reset output first
+    setSlides(null); setCard(null);
+    setCardImage(null); setSlideImages([]);
+    setCurrentSlide(0); setError("");
+    // Pre-fill
+    setSelectedUid(trigger.uid);
+    setOutputType(trigger.format);
+    setOpen(true);
+    // Scroll panel into view
+    setTimeout(() => {
+      document.getElementById("lvp-anchor")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 80);
+  }, [trigger]);
+
+  const allPieces = [
+    ...(lesson.timeline?.open || []),
+    ...(lesson.timeline?.core || []),
+    ...(lesson.timeline?.close || []),
+  ];
+  const selectedPiece = allPieces.find((p) => p.uid === selectedUid);
+
+  const buildPrompt = () => {
+    if (!selectedPiece) return "";
+    const isEmb = !!selectedPiece.transformedTo;
+    const origTitle = selectedPiece.title || "activity";
+    const embTitle = selectedPiece.transformedTo?.title || origTitle;
+    const why = selectedPiece.transformedTo?.why || selectedPiece.transformWhy || "";
+    return [
+      `Subject: ${lesson.subject || "General"}`,
+      `Grade: ${lesson.grade || "K-12"}`,
+      `Learning goal: ${lesson.goal || "(not specified)"}`,
+      `Original non-embodied activity: "${origTitle}" (type: ${selectedPiece.type || "activity"})`,
+      isEmb
+        ? `Embodied transformation: "${embTitle}"${why ? `\nRationale: ${why}` : ""}`
+        : `Note: this activity has not been transformed yet — propose an embodied version.`,
+    ].join("\n");
+  };
+
+  const buildImgPrompt = (idx) => {
+    const isEmb = !!selectedPiece?.transformedTo;
+    const embTitle = isEmb ? selectedPiece.transformedTo?.title : selectedPiece?.title;
+    if (idx === 1 || idx === "card") {
+      return `Flat illustration, educational style, warm muted colors. A student performing: "${embTitle}" for ${lesson.subject || "school"}. Body posture clearly visible. No text. Clean lines. Academic presentation style.`;
+    }
+    if (idx === 2) {
+      return `Minimal flat illustration. Abstract: body movement connected to cognitive learning. Stylized brain and body. Warm muted palette. No text.`;
+    }
+    return `Flat illustration, educational style. A student doing a passive activity: "${selectedPiece?.title}". Traditional classroom. Clean lines. No text.`;
+  };
+
+  const generate = async () => {
+    if (!selectedPiece) return;
+    setError("");
+    setGenerating(true);
+    setSlides(null);
+    setCard(null);
+    setCardImage(null);
+    setSlideImages([]);
+    setCurrentSlide(0);
+
+    const prompt = buildPrompt();
+
+    if (outputType === "slides") {
+      const raw = await callClaudeModel(vizSlideSystem, prompt, 1200, "claude-haiku-4-5-20251001");
+      const parsed = safeJSON(raw);
+      if (!parsed?.slides) {
+        setError("Could not generate — try again.");
+        setGenerating(false);
+        return;
+      }
+      setSlides(parsed.slides);
+      setGenerating(false);
+      setGeneratingImage(true);
+      const imgs = await Promise.all(parsed.slides.map((_, i) => callGemini(buildImgPrompt(i))));
+      setSlideImages(imgs);
+      setGeneratingImage(false);
+    } else {
+      const raw = await callClaudeModel(vizCardSystem, prompt, 800, "claude-haiku-4-5-20251001");
+      const parsed = safeJSON(raw);
+      if (!parsed) {
+        setError("Could not generate — try again.");
+        setGenerating(false);
+        return;
+      }
+      setCard(parsed);
+      setGenerating(false);
+      setGeneratingImage(true);
+      const img = await callGemini(buildImgPrompt("card"));
+      setCardImage(img);
+      setGeneratingImage(false);
+    }
+  };
+
+  // Auto-fire when trigger sets selectedUid (piece was pre-selected via row button).
+  // We use a ref to track whether we've auto-fired for the current trigger so we
+  // don't fire again when the user manually changes the dropdown.
+  const autoFiredForTs = useRef(null);
+  useEffect(() => {
+    if (!trigger || !selectedUid || trigger.ts === autoFiredForTs.current) return;
+    if (trigger.uid !== selectedUid) return; // state hasn't caught up yet
+    autoFiredForTs.current = trigger.ts;
+    generate();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedUid, trigger]);
+
+  const reset = () => {
+    setSlides(null); setCard(null);
+    setCardImage(null); setSlideImages([]);
+    setCurrentSlide(0); setError("");
+    setSelectedUid(""); setOutputType("slides");
+  };
+
+  return (
+    <div style={{
+      marginTop: 20, marginBottom: 4,
+      border: `1.5px solid ${C.ink}`, borderRadius: 14,
+      overflow: "hidden",
+    }}>
+      {/* Collapsible header */}
+      <button
+        onClick={() => { setOpen(o => !o); if (open) reset(); }}
+        style={{
+          width: "100%", background: open ? C.ink : C.paperDeep,
+          color: open ? C.paper : C.ink,
+          border: "none", padding: "12px 18px",
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          fontFamily: FM, fontSize: 11, letterSpacing: 0.8, textTransform: "uppercase",
+          cursor: "pointer",
+        }}
+      >
+        <span>
+          🎨 Embodied Learning Visualization
+          {generating && (
+            <span style={{ marginLeft: 10, fontFamily: FM, fontSize: 9, opacity: 0.7, letterSpacing: 0.5 }}>
+              · generating…
+            </span>
+          )}
+        </span>
+        <span style={{ fontFamily: FM, fontSize: 14 }}>{open ? "▾" : "▸"}</span>
+      </button>
+
+      {open && (
+        <div style={{ padding: "18px 20px", background: C.cream }}>
+          {/* Activity + format row */}
+          {!slides && !card && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {/* Activity picker */}
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+                <div style={{ flex: "1 1 200px", display: "flex", flexDirection: "column", gap: 4 }}>
+                  <label style={{ fontFamily: FM, fontSize: 9, letterSpacing: 1, color: C.muted, textTransform: "uppercase" }}>
+                    Activity
+                  </label>
+                  <select
+                    value={selectedUid}
+                    onChange={e => setSelectedUid(e.target.value)}
+                    style={{
+                      padding: "8px 12px", fontSize: 13, fontFamily: FB,
+                      border: `1.5px solid ${C.ink}`, borderRadius: 8,
+                      background: C.paper, outline: "none", cursor: "pointer",
+                    }}
+                  >
+                    <option value="">— pick an activity —</option>
+                    {allPieces.map((p) => (
+                      <option key={p.uid} value={p.uid}>
+                        {p.transformedTo ? "🤸 " : "💺 "}
+                        {p.title}
+                        {p.transformedTo ? ` → ${p.transformedTo.title || p.transformedTo}` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Format toggle */}
+                <div style={{ display: "flex", gap: 6 }}>
+                  {[
+                    { id: "slides", label: "🖼️ Slides" },
+                    { id: "card", label: "🃏 Card" },
+                  ].map(opt => (
+                    <button
+                      key={opt.id}
+                      onClick={() => setOutputType(opt.id)}
+                      style={{
+                        padding: "8px 14px", fontFamily: FB, fontSize: 12,
+                        background: outputType === opt.id ? C.ink : C.paper,
+                        color: outputType === opt.id ? C.paper : C.ink,
+                        border: `1.5px solid ${C.ink}`, borderRadius: 8, cursor: "pointer",
+                      }}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+
+                <button
+                  onClick={generate}
+                  disabled={!selectedUid || generating}
+                  style={{
+                    padding: "8px 18px", fontFamily: FD, fontSize: 14, fontWeight: 600,
+                    background: (!selectedUid || generating) ? C.muted : C.coral,
+                    color: "white", border: "none", borderRadius: 8,
+                    cursor: (!selectedUid || generating) ? "not-allowed" : "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {generating ? "Generating…" : "Generate →"}
+                </button>
+              </div>
+
+              {error && (
+                <div style={{ fontFamily: FM, fontSize: 11, color: C.coral }}>⚠ {error}</div>
+              )}
+            </div>
+          )}
+
+          {/* Result + reset */}
+          {(slides || card) && (
+            <div>
+              <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
+                <button
+                  onClick={reset}
+                  style={{
+                    background: "transparent", border: `1px solid ${C.muted}`, color: C.muted,
+                    padding: "5px 12px", borderRadius: 16, fontFamily: FM, fontSize: 9,
+                    letterSpacing: 0.8, textTransform: "uppercase", cursor: "pointer",
+                  }}
+                >
+                  ↺ Reset
+                </button>
+              </div>
+
+              {slides && (
+                <VizSlideDeckView
+                  slides={slides}
+                  images={slideImages}
+                  generatingImages={generatingImage}
+                  currentSlide={currentSlide}
+                  setCurrentSlide={setCurrentSlide}
+                  lesson={lesson}
+                />
+              )}
+
+              {card && (
+                <ScenarioCardView
+                  card={card}
+                  image={cardImage}
+                  generatingImage={generatingImage}
+                  lesson={lesson}
+                  piece={selectedPiece}
+                />
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
 // Lesson Modal (preview)
 // ============================================================
 function LessonModal({ lesson, me, onClose, onComment, onStar, onPlay, onDelete }) {
   const [text, setText] = useState("");
   const [confirmDel, setConfirmDel] = useState(false);
+  // vizTrigger fires the LessonVisualizerPanel: { uid, format, ts }
+  const [vizTrigger, setVizTrigger] = useState(null);
   const starred = (lesson.stars || []).includes(me.id);
   const isMine = lesson.authorId === me.id;
   const submit = () => { if (text.trim()) { onComment(text.trim()); setText(""); } };
+
+  const fireViz = (piece) => {
+    const rec = recommendViz(piece);
+    setVizTrigger({ uid: piece.uid, format: rec.format, ts: Date.now() });
+  };
+
+  // Auto-generate a visualization as soon as the modal opens.
+  // Pick the highest-priority activity: embodied first, then lecture/reading/video.
+  useEffect(() => {
+    const flat = [
+      ...(lesson.timeline?.open  || []),
+      ...(lesson.timeline?.core  || []),
+      ...(lesson.timeline?.close || []),
+    ];
+    if (flat.length === 0) return;
+    // Sort: high-priority first, then preserve original order as tiebreaker.
+    const sorted = flat
+      .map((p, i) => ({ p, i, rec: recommendViz(p) }))
+      .sort((a, b) => {
+        const pa = a.rec.priority === "high" ? 0 : 1;
+        const pb = b.rec.priority === "high" ? 0 : 1;
+        return pa - pb || a.i - b.i;
+      });
+    const best = sorted[0];
+    setVizTrigger({ uid: best.p.uid, format: best.rec.format, ts: Date.now() });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const allPieces = [
     ...lesson.timeline.open.map(p => ({ ...p, _phase: "Opening", _phaseIcon: "🌅" })),
@@ -2842,11 +3234,53 @@ function LessonModal({ lesson, me, onClose, onComment, onStar, onPlay, onDelete 
                 borderLeft: `6px solid ${em ? C.coral : C.ink}`,
                 borderRadius: 12, padding: "14px 18px",
               }}>
+                {/* Row header: phase label + viz recommendation + button */}
                 <div style={{
-                  fontFamily: FM, fontSize: 9, color: C.muted,
-                  letterSpacing: 1, textTransform: "uppercase", marginBottom: 4,
+                  display: "flex", justifyContent: "space-between", alignItems: "center",
+                  marginBottom: 4, flexWrap: "wrap", gap: 6,
                 }}>
-                  {p._phaseIcon} {p._phase} · Step {i + 1} {em && "· Embodied"}
+                  <div style={{
+                    fontFamily: FM, fontSize: 9, color: C.muted,
+                    letterSpacing: 1, textTransform: "uppercase",
+                  }}>
+                    {p._phaseIcon} {p._phase} · Step {i + 1} {em && "· Embodied"}
+                  </div>
+                  {/* Visual recommendation badge + trigger button */}
+                  {(() => {
+                    const rec = recommendViz(p);
+                    const isActive = vizTrigger?.uid === p.uid;
+                    return (
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{
+                          fontFamily: FM, fontSize: 8, letterSpacing: 0.5,
+                          color: rec.priority === "high" ? C.coral : C.muted,
+                          background: rec.priority === "high" ? C.coral + "15" : C.paperDeep,
+                          border: `1px solid ${rec.priority === "high" ? C.coral + "55" : C.muted + "44"}`,
+                          borderRadius: 20, padding: "2px 8px",
+                          textTransform: "uppercase",
+                        }}
+                          title={rec.reason}
+                        >
+                          {rec.badge}
+                        </span>
+                        <button
+                          onClick={() => fireViz(p)}
+                          title={rec.reason}
+                          style={{
+                            background: isActive ? C.coral : "transparent",
+                            color: isActive ? "white" : C.coral,
+                            border: `1.5px solid ${C.coral}`,
+                            padding: "3px 10px", borderRadius: 20,
+                            fontFamily: FM, fontSize: 8, letterSpacing: 0.8,
+                            textTransform: "uppercase", cursor: "pointer",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {isActive ? "✓ Visualizing" : "🎨 Visualize"}
+                        </button>
+                      </div>
+                    );
+                  })()}
                 </div>
                 <div style={{
                   fontFamily: FD, fontSize: 15, fontWeight: 700, lineHeight: 1.3,
@@ -2874,6 +3308,10 @@ function LessonModal({ lesson, me, onClose, onComment, onStar, onPlay, onDelete 
             );
           })}
         </div>
+
+        {/* Inline visualizer — auto-triggered by per-activity buttons above */}
+        <div id="lvp-anchor" />
+        <LessonVisualizerPanel lesson={lesson} trigger={vizTrigger} />
 
         <div style={{
           marginTop: 16, paddingTop: 16, borderTop: `1.5px solid ${C.ink}`,
