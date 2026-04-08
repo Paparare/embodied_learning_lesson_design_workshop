@@ -8,12 +8,10 @@
 // Model: gemini-2.0-flash-preview-image-generation
 // Set GEMINI_API_KEY in your Vercel dashboard under Settings → Environment Variables.
 
-// NOTE: Vercel Hobby plan caps serverless functions at 10 seconds.
-// Gemini image generation typically completes in 5-8s for short prompts — within
-// the 10s window. If it occasionally times out, callGemini() returns null and the
-// viz renders without the illustration (text-only, still fully usable).
-// To unlock reliable 15-30s generation, upgrade to Vercel Pro and add:
-//   export const maxDuration = 60;
+// Vercel Pro: allow up to 60 seconds per invocation.
+// Gemini image generation can take 15-30s — well within this window.
+// If you ever downgrade to Hobby (10s cap), comment this line out.
+export const maxDuration = 60;
 
 // Maximum prompt length to prevent abuse.
 const MAX_PROMPT_CHARS = 1000;
