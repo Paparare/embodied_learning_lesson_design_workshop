@@ -757,6 +757,31 @@ function Designer({ me, lessons, setLessons, setView, onRegisterReset }) {
 
   useEffect(() => {
     if (!touchDrag) return;
+
+    // --- Auto-scroll when finger is near viewport edges ---
+    const EDGE_ZONE = 60;      // px from edge to start scrolling
+    const MAX_SPEED = 18;       // max px per frame
+    let scrollRaf = null;
+
+    const autoScroll = () => {
+      const td = touchDragRef.current;
+      if (!td) return;
+      const vh = window.innerHeight;
+      let speed = 0;
+      if (td.y > vh - EDGE_ZONE) {
+        // Near bottom edge — scroll down
+        speed = MAX_SPEED * Math.min(1, (td.y - (vh - EDGE_ZONE)) / EDGE_ZONE);
+      } else if (td.y < EDGE_ZONE) {
+        // Near top edge — scroll up
+        speed = -MAX_SPEED * Math.min(1, (EDGE_ZONE - td.y) / EDGE_ZONE);
+      }
+      if (speed !== 0) {
+        window.scrollBy(0, speed);
+      }
+      scrollRaf = requestAnimationFrame(autoScroll);
+    };
+    scrollRaf = requestAnimationFrame(autoScroll);
+
     const onMove = (e) => {
       const t = e.touches[0];
       if (!t) return;
@@ -765,10 +790,11 @@ function Designer({ me, lessons, setLessons, setView, onRegisterReset }) {
       setTouchDrag((td) => td ? { ...td, x, y } : td);
       const { slot } = resolveTouchDrop(x, y);
       setDragOver(slot);
-      // Prevent page scroll while dragging
+      // Prevent page scroll while dragging (auto-scroll handles it instead)
       e.preventDefault();
     };
     const onEnd = (e) => {
+      if (scrollRaf) { cancelAnimationFrame(scrollRaf); scrollRaf = null; }
       const td = touchDragRef.current;
       touchDragRef.current = null;
       setTouchDrag(null);
@@ -783,6 +809,7 @@ function Designer({ me, lessons, setLessons, setView, onRegisterReset }) {
     window.addEventListener("touchend", onEnd);
     window.addEventListener("touchcancel", onEnd);
     return () => {
+      if (scrollRaf) { cancelAnimationFrame(scrollRaf); scrollRaf = null; }
       window.removeEventListener("touchmove", onMove);
       window.removeEventListener("touchend", onEnd);
       window.removeEventListener("touchcancel", onEnd);
